@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<title>Gerçekçi Su Simülasyonu (WebGL2)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+  canvas { width: 100vw; height: 100vh; display: block; touch-action: none; cursor: grab; }
+  #ui { position: fixed; left: 12px; top: 12px; color: #fff; font-size: 13px; line-height: 1.5;
+        background: rgba(0,0,0,.45); padding: 10px 12px; border-radius: 10px; backdrop-filter: blur(6px); max-width: 300px; }
+  #ui button { margin: 6px 6px 0 0; padding: 5px 10px; border: 0; border-radius: 6px; cursor: pointer;
+               background: #2b8cff; color: #fff; font-size: 12px; }
+  #ui button.off { background: #555; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <b>Su Simülasyonu</b><br>
+  Suya tıkla/sürükle: dalga &nbsp;|&nbsp; Küreyi sürükle: taşı<br>
+  Boşluğa sürükle: kamerayı döndür &nbsp;|&nbsp; Tekerlek: yakınlaştır<br>
+  Kısayollar: <b>Boşluk</b> küreyi bırak, <b>R</b> yağmur, <b>P</b> duraklat<br>
+  <button id="bRain" class="off">Yağmur</button>
+  <button id="bDrop">Küreyi bırak</button>
+  <button id="bPause" class="off">Duraklat</button>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+/* ---------------------------------------------------------- WebGL kurulumu */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+if (!gl) { alert('Bu demo WebGL2 gerektiriyor.'); return; }
+
+const extCBF = gl.getExtension('EXT_color_buffer_float');
+const extCBH = gl.getExtension('EXT_color_buffer_half_float');
+const linFloat = gl.getExtension('OES_texture_float_linear');
+if (!extCBF && !extCBH) { alert('Float texture render desteği yok.'); return; }
+const useF32 = !!(extCBF && linFloat);
+const TEX_INTERNAL = useF32 ? gl.RGBA32F : gl.RGBA16F;
+const TEX_TYPE     = useF32 ? gl.FLOAT   : gl.HALF_FLOAT;
+
+const N = 256;            // su yüksekliği alanı çözünürlüğü
+const CAUSTIC_RES = 1024; // kostik dokusu çözünürlüğü
+const GRID = 256;         // su yüzeyi ağ çözünürlüğü
+const HEAD = '#version 300 es\nprecision highp float;\nprecision highp sampler2D;\n';
+
+/* ---------------------------------------------------------- Ortak GLSL */
+const COMMON = `
+const float IOR_AIR = 1.0;
+const float IOR_WATER = 1.333;
+const float poolHeight = 1.0;
+const vec3 abovewaterColor = vec3(0.25, 1.0, 1.25);
+const vec3 underwaterColor = vec3(0.4, 0.9, 1.0);
+uniform vec3 light;
+uniform vec3 sphereCenter;
+uniform float sphereRadius;
+uniform sampler2D water;
+uniform sampler2D causticTex;
+
+vec2 intersectCube(vec3 origin, vec3 ray, vec3 cubeMin, vec3 cubeMax) {
+  vec3 tMin = (cubeMin - origin) / ray;
+  vec3 tMax = (cubeMax - origin) / ray;
+  vec3 t1 = min(tMin, tMax);
+  vec3 t2 = max(tMin, tMax);
+  float tNear = max(max(t1.x, t1.y), t1.z);
+  float tFar  = min(min(t2.x, t2.y), t2.z);
+  return vec2(tNear, tFar);
+}
+float intersectSphere(vec3 origin, vec3 ray, vec3 center, float radius) {
+  vec3 toSphere = origin - center;
+  float a = dot(ray, ray);
+  float b = 2.0 * dot(toSphere, ray);
+  float c = dot(toSphere, toSphere) - radius * radius;
+  float disc = b * b - 4.0 * a * c;
+  if (disc > 0.0) {
+    float t = (-b - sqrt(disc)) / (2.0 * a);
+    if (t > 0.0) return t;
+  }
+  return 1.0e6;
+}
+
+float hash21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash21(i), hash21(i + vec2(1,0)), f.x),
+             mix(hash21(i + vec2(0,1)), hash21(i + vec2(1,1)), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) { s += a * vnoise(p); p *= 2.03; a *= 0.5; }
+  return s;
+}
+
+vec3 skyColor(vec3 d) {
+  float h = clamp(d.y, 0.0, 1.0);
+  vec3 c = mix(vec3(0.80, 0.88, 0.96), vec3(0.22, 0.46, 0.88), pow(h, 0.45));
+  float s = max(dot(d, light), 0.0);
+  c += vec3(1.0, 0.75, 0.45) * (pow(s, 6.0) * 0.25 + pow(s, 64.0) * 0.4);
+  vec2 uv = d.xz / (d.y + 0.15) * 0.6;
+  float cl = smoothstep(0.45, 0.85, fbm(uv * 1.5 + 3.0));
+  c = mix(c, vec3(1.0), cl * 0.8 * smoothstep(0.0, 0.25, d.y));
+  return c;
+}
+
+vec3 tileColor(vec2 uv) {
+  vec2 g = uv * 6.0;
+  vec2 id = floor(g), f = fract(g);
+  float h = hash21(id);
+  vec3 base = mix(vec3(0.62, 0.78, 0.86), vec3(0.82, 0.90, 0.93), h);
+  base *= 0.92 + 0.08 * vnoise(g * 12.0);
+  vec2 e = min(f, 1.0 - f);
+  float edge = smoothstep(0.015, 0.05, min(e.x, e.y));
+  return mix(vec3(0.35, 0.42, 0.45), base, edge);
+}
+
+vec3 getSphereColor(vec3 point) {
+  vec3 color = vec3(0.62, 0.42, 0.36);
+  color *= 1.0 - 0.9 / pow((1.0 + sphereRadius - abs(point.x)) / sphereRadius, 3.0);
+  color *= 1.0 - 0.9 / pow((1.0 + sphereRadius - abs(point.z)) / sphereRadius, 3.0);
+  color *= 1.0 - 0.9 / pow((point.y + 1.0 + sphereRadius) / sphereRadius, 3.0);
+
+  vec3 sphereNormal = (point - sphereCenter) / sphereRadius;
+  vec3 refractedLight = refract(-light, vec3(0.0, 1.0, 0.0), IOR_AIR / IOR_WATER);
+  float diffuse = max(0.0, dot(-refractedLight, sphereNormal)) * 0.5;
+  vec4 info = texture(water, point.xz * 0.5 + 0.5);
+  if (point.y < info.r) {
+    vec4 caustic = texture(causticTex, 0.75 * (point.xz - point.y * refractedLight.xz / refractedLight.y) * 0.5 + 0.5);
+    diffuse *= caustic.r * 4.0;
+  }
+  color += diffuse;
+  return color;
+}
+
+vec3 getWallColor(vec3 point) {
+  float scale = 0.5;
+  vec3 wallColor;
+  vec3 normal;
+  if (abs(point.x) > 0.999) {
+    wallColor = tileColor(point.yz * 0.5 + vec2(1.0, 0.5));
+    normal = vec3(-point.x, 0.0, 0.0);
+  } else if (abs(point.z) > 0.999) {
+    wallColor = tileColor(point.yx * 0.5 + vec2(1.0, 0.5));
+    normal = vec3(0.0, 0.0, -point.z);
+  } else {
+    wallColor = tileColor(point.xz * 0.5 + 0.5);
+    normal = vec3(0.0, 1.0, 0.0);
+  }
+  scale /= length(point);
+  scale *= 1.0 - 0.9 / pow(length(point - sphereCenter) / sphereRadius, 4.0);
+
+  vec3 refractedLight = -refract(-light, vec3(0.0, 1.0, 0.0), IOR_AIR / IOR_WATER);
+  float diffuse = max(0.0, dot(refractedLight, normal));
+  vec4 info = texture(water, point.xz * 0.5 + 0.5);
+  if (point.y < info.r) {
+    vec4 caustic = texture(causticTex, 0.75 * (point.xz - point.y * refractedLight.xz / refractedLight.y) * 0.5 + 0.5);
+    scale += diffuse * caustic.r * 2.0 * caustic.g;
+  } else {
+    vec2 t = intersectCube(point, refractedLight, vec3(-1.0, -poolHeight, -1.0), vec3(1.0, 2.0, 1.0));
+    diffuse *= 1.0 / (1.0 + exp(-200.0 / (1.0 + 10.0 * (t.y - t.x)) * (point.y + refractedLight.y * t.y - 2.0 / 12.0)));
+    scale += diffuse * 0.5;
+  }
+  return wallColor * scale;
+}
+`;
+
+/* ---------------------------------------------------------- Shader'lar */
+const quadVS = HEAD + `
+layout(location=0) in vec2 p; out vec2 coord;
+void main(){ coord = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const simHead = HEAD + `uniform sampler2D tex; uniform vec2 delta; in vec2 coord; out vec4 o;\n`;
+
+const dropFS = simHead + `
+const float PI = 3.141592653589793;
+uniform vec2 center; uniform float radius; uniform float strength;
+void main(){
+  vec4 info = texture(tex, coord);
+  float drop = max(0.0, 1.0 - length(center * 0.5 + 0.5 - coord) / radius);
+  drop = 0.5 - cos(drop * PI) * 0.5;
+  info.r += drop * strength;
+  o = info;
+}`;
+
+const updateFS = simHead + `
+void main(){
+  vec4 info = texture(tex, coord);
+  vec2 dx = vec2(delta.x, 0.0), dy = vec2(0.0, delta.y);
+  float average = (texture(tex, coord - dx).r + texture(tex, coord - dy).r +
+                   texture(tex, coord + dx).r + texture(tex, coord + dy).r) * 0.25;
+  info.g += (average - info.r) * 2.0;
+  info.g *= 0.995;
+  info.r += info.g;
+  o = info;
+}`;
+
+const normalFS = simHead + `
+void main(){
+  vec4 info = texture(tex, coord);
+  vec3 dx = vec3(delta.x, texture(tex, vec2(coord.x + delta.x, coord.y)).r - info.r, 0.0);
+  vec3 dy = vec3(0.0, texture(tex, vec2(coord.x, coord.y + delta.y)).r - info.r, delta.y);
+  info.ba = normalize(cross(dy, dx)).xz;
+  o = info;
+}`;
+
+const sphereMoveFS = simHead + `
+uniform vec3 oldCenter; uniform vec3 newCenter; uniform float radius;
+float volumeInSphere(vec3 c){
+  vec3 toCenter = vec3(coord.x * 2.0 - 1.0, 0.0, coord.y * 2.0 - 1.0) - c;
+  float t = length(toCenter) / radius;
+  float dy = exp(-pow(t * 1.5, 6.0));
+  float ymin = min(0.0, c.y - dy);
+  float ymax = min(max(0.0, c.y + dy), ymin + 2.0 * dy);
+  return (ymax - ymin) * 0.1;
+}
+void main(){
+  vec4 info = texture(tex, coord);
+  info.r += volumeInSphere(oldCenter);
+  info.r -= volumeInSphere(newCenter);
+  o = info;
+}`;
+
+const poolVS = HEAD + COMMON + `
+layout(location=0) in vec3 position; uniform mat4 mvp; out vec3 pos;
+void main(){ pos = position; gl_Position = mvp * vec4(pos, 1.0); }`;
+const poolFS = HEAD + COMMON + `
+in vec3 pos; out vec4 o;
+void main(){
+  vec3 color = getWallColor(pos);
+  vec4 info = texture(water, pos.xz * 0.5 + 0.5);
+  if (pos.y < info.r) color *= underwaterColor * 1.2;
+  o = vec4(color, 1.0);
+}`;
+
+const sphereVS = HEAD + COMMON + `
+layout(location=0) in vec3 position; uniform mat4 mvp; out vec3 pos;
+void main(){ pos = sphereCenter + position * sphereRadius; gl_Position = mvp * vec4(pos, 1.0); }`;
+const sphereFS = HEAD + COMMON + `
+in vec3 pos; out vec4 o;
+void main(){
+  vec3 color = getSphereColor(pos);
+  vec4 info = texture(water, pos.xz * 0.5 + 0.5);
+  if (pos.y < info.r) color *= underwaterColor * 1.2;
+  o = vec4(color, 1.0);
+}`;
+
+const waterVS = HEAD + COMMON + `
+layout(location=0) in vec3 position; uniform mat4 mvp; out vec3 pos;
+void main(){
+  vec4 info = texture(water, position.xz * 0.5 + 0.5);
+  pos = position; pos.y += info.r;
+  gl_Position = mvp * vec4(pos, 1.0);
+}`;
+const waterFS = HEAD + COMMON + `
+uniform vec3 eye; uniform float underwater;
+in vec3 pos; out vec4 o;
+
+vec3 getSurfaceRayColor(vec3 origin, vec3 ray, vec3 waterColor) {
+  vec3 color;
+  float q = intersectSphere(origin, ray, sphereCenter, sphereRadius);
+  if (q < 1.0e6) {
+    color = getSphereColor(origin + ray * q);
+  } else if (ray.y < 0.0) {
+    vec2 t = intersectCube(origin, ray, vec3(-1.0, -poolHeight, -1.0), vec3(1.0, 2.0, 1.0));
+    color = getWallColor(origin + ray * t.y);
+  } else {
+    vec2 t = intersectCube(origin, ray, vec3(-1.0, -poolHeight, -1.0), vec3(1.0, 2.0, 1.0));
+    vec3 hit = origin + ray * t.y;
+    if (hit.y < 2.0 / 12.0) {
+      color = getWallColor(hit);
+    } else {
+      color = skyColor(ray);
+      color += vec3(pow(max(0.0, dot(light, ray)), 5000.0)) * vec3(10.0, 8.0, 6.0);
+    }
+  }
+  if (ray.y < 0.0) color *= waterColor;
+  return color;
+}
+
+void main(){
+  vec2 coord = pos.xz * 0.5 + 0.5;
+  vec4 info = texture(water, coord);
+  for (int i = 0; i < 5; i++) { coord += info.ba * 0.005; info = texture(water, coord); }
+  vec3 normal = vec3(info.b, sqrt(max(0.0, 1.0 - dot(info.ba, info.ba))), info.a);
+  vec3 incomingRay = normalize(pos - eye);
+
+  vec3 color;
+  if (underwater > 0.5) {
+    normal = -normal;
+    vec3 reflectedRay = reflect(incomingRay, normal);
+    vec3 refractedRay = refract(incomingRay, normal, IOR_WATER / IOR_AIR);
+    float fresnel = mix(0.5, 1.0, pow(1.0 - dot(normal, -incomingRay), 3.0));
+    vec3 reflectedColor = getSurfaceRayColor(pos, reflectedRay, underwaterColor);
+    vec3 refractedColor = getSurfaceRayColor(pos, refractedRay, vec3(1.0)) * vec3(0.8, 1.0, 1.1);
+    color = mix(reflectedColor, refractedColor, (1.0 - fresnel) * length(refractedRay));
+  } else {
+    vec3 reflectedRay = reflect(incomingRay, normal);
+    vec3 refractedRay = refract(incomingRay, normal, IOR_AIR / IOR_WATER);
+    float fresnel = mix(0.25, 1.0, pow(1.0 - dot(normal, -incomingRay), 3.0));
+    vec3 reflectedColor = getSurfaceRayColor(pos, reflectedRay, abovewaterColor);
+    vec3 refractedColor = getSurfaceRayColor(pos, refractedRay, abovewaterColor);
+    color = mix(refractedColor, reflectedColor, fresnel);
+  }
+  o = vec4(color, 1.0);
+}`;
+
+const causticVS = HEAD + COMMON + `
+layout(location=0) in vec3 position;
+out vec3 oldPos; out vec3 newPos; out vec3 ray;
+vec3 project(vec3 origin, vec3 r, vec3 refractedLight) {
+  vec2 tcube = intersectCube(origin, r, vec3(-1.0, -poolHeight, -1.0), vec3(1.0, 2.0, 1.0));
+  origin += r * tcube.y;
+  float tplane = (-origin.y - 1.0) / refractedLight.y;
+  return origin + refractedLight * tplane;
+}
+void main(){
+  vec4 info = texture(water, position.xz * 0.5 + 0.5);
+  info.ba *= 0.5;
+  vec3 normal = vec3(info.b, sqrt(max(0.0, 1.0 - dot(info.ba, info.ba))), info.a);
+  vec3 refractedLight = refract(-light, vec3(0.0, 1.0, 0.0), IOR_AIR / IOR_WATER);
+  ray = refract(-light, normal, IOR_AIR / IOR_WATER);
+  oldPos = project(position, refractedLight, refractedLight);
+  newPos = project(position + vec3(0.0, info.r, 0.0), ray, refractedLight);
+  gl_Position = vec4(0.75 * (newPos.xz + refractedLight.xz / refractedLight.y), 0.0, 1.0);
+}`;
+const causticFS = HEAD + COMMON + `
+in vec3 oldPos; in vec3 newPos; in vec3 ray; out vec4 o;
+void main(){
+  float oldArea = length(dFdx(oldPos)) * length(dFdy(oldPos));
+  float newArea = length(dFdx(newPos)) * length(dFdy(newPos));
+  o = vec4(oldArea / newArea * 0.2, 1.0, 0.0, 0.0);
+
+  vec3 refractedLight = refract(-light, vec3(0.0, 1.0, 0.0), IOR_AIR / IOR_WATER);
+
+  // küre gölgesi
+  vec3 dir = (sphereCenter - newPos) / sphereRadius;
+  vec3 area = cross(dir, refractedLight);
+  float shadow = dot(area, area);
+  float dist = dot(dir, -refractedLight);
+  shadow = 1.0 + (shadow - 1.0) / (0.05 + dist * 0.025);
+  shadow = clamp(1.0 / (1.0 + exp(-shadow)), 0.0, 1.0);
+  shadow = mix(1.0, shadow, clamp(dist * 2.0, 0.0, 1.0));
+  o.g = shadow;
+
+  // havuz kenarı gölgesi
+  vec2 t = intersectCube(newPos, -refractedLight, vec3(-1.0, -poolHeight, -1.0), vec3(1.0, 2.0, 1.0));
+  o.r *= 1.0 / (1.0 + exp(-200.0 / (1.0 + 2.0 * (t.y - t.x)) * (newPos.y - refractedLight.y * t.y - 2.0 / 12.0)));
+}`;
+
+/* ---------------------------------------------------------- Yardımcılar */
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw new Error('Shader hatası'); }
+  return s;
+}
+function makeProg(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(p)); throw new Error('Link hatası'); }
+  p.loc = {};
+  return p;
+}
+let cur = null;
+const use = p => { cur = p; gl.useProgram(p); };
+const loc = n => (n in cur.loc ? cur.loc[n] : (cur.loc[n] = gl.getUniformLocation(cur, n)));
+function set(n, v) {
+  const l = loc(n); if (l == null) return;
+  if (typeof v === 'number') gl.uniform1f(l, v);
+  else if (v.length === 2) gl.uniform2fv(l, v);
+  else if (v.length === 3) gl.uniform3fv(l, v);
+  else if (v.length === 16) gl.uniformMatrix4fv(l, false, v);
+}
+function seti(n, v) { const l = loc(n); if (l != null) gl.uniform1i(l, v); }
+
+function makeTarget(w, h, linear = true) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, TEX_INTERNAL, w, h, 0, gl.RGBA, TEX_TYPE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, linear ? gl.LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, linear ? gl.LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo, w, h };
+}
+
+function makeVAO(data, size, idx) {
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, size, gl.FLOAT, false, 0, 0);
+  if (idx) {
+    const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  }
+  gl.bindVertexArray(null);
+  return { vao, count: idx ? idx.length : data.length / size, indexed: !!idx,
+           type: idx instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT };
+}
+function draw(g) {
+  gl.bindVertexArray(g.vao);
+  if (g.indexed) gl.drawElements(gl.TRIANGLES, g.count, g.type, 0);
+  else gl.drawArrays(gl.TRIANGLES, 0, g.count);
+}
+
+/* ---------------------------------------------------------- Geometri */
+const quad = makeVAO([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1], 2);
+
+// su yüzeyi ağı (yukarı bakan CCW üçgenler)
+const grid = (() => {
+  const v = [], idx = new Uint32Array(GRID * GRID * 6);
+  for (let j = 0; j <= GRID; j++) for (let i = 0; i <= GRID; i++) v.push(i / GRID * 2 - 1, 0, j / GRID * 2 - 1);
+  let k = 0;
+  for (let j = 0; j < GRID; j++) for (let i = 0; i < GRID; i++) {
+    const a = j * (GRID + 1) + i, b = a + 1, c = a + GRID + 1, d = c + 1;
+    idx[k++] = a; idx[k++] = c; idx[k++] = b;
+    idx[k++] = b; idx[k++] = c; idx[k++] = d;
+  }
+  return makeVAO(v, 3, idx);
+})();
+
+// havuz: 5 yüz (üstü açık), dışa bakan CCW
+const cube = (() => {
+  const hy = 7 / 12, cy = -5 / 12;
+  const faces = [
+    { n: [1,0,0],  u: [0,hy,0], v: [0,0,1] },
+    { n: [-1,0,0], u: [0,0,1],  v: [0,hy,0] },
+    { n: [0,0,1],  u: [1,0,0],  v: [0,hy,0] },
+    { n: [0,0,-1], u: [0,hy,0], v: [1,0,0] },
+    { n: [0,-1,0], u: [1,0,0],  v: [0,0,1] },
+  ];
+  const v = [];
+  for (const f of faces) {
+    const c = [f.n[0], cy + f.n[1] * (f.n[1] ? 1 : 0) * (f.n[1] < 0 ? hy : 0) + 0, f.n[2]];
+    if (f.n[1] === 0) c[1] = cy;           // yan duvarlar
+    else c[1] = cy - hy;                    // taban
+    const P = (su, sv) => [0,1,2].map(i => c[i] + su * f.u[i] + sv * f.v[i]);
+    const q = [P(-1,-1), P(1,-1), P(1,1), P(-1,1)];
+    [0,1,2, 0,2,3].forEach(i => v.push(...q[i]));
+  }
+  return makeVAO(v, 3);
+})();
+
+// küre
+const sphereMesh = (() => {
+  const L = 32, M = 48, v = [], idx = [];
+  for (let a = 0; a <= L; a++) for (let b = 0; b <= M; b++) {
+    const th = a / L * Math.PI, ph = b / M * Math.PI * 2;
+    v.push(Math.sin(th) * Math.cos(ph), Math.cos(th), Math.sin(th) * Math.sin(ph));
+  }
+  for (let a = 0; a < L; a++) for (let b = 0; b < M; b++) {
+    const i0 = a * (M + 1) + b, i1 = i0 + 1, i2 = i0 + M + 1, i3 = i2 + 1;
+    idx.push(i0, i2, i1, i1, i2, i3);
+  }
+  return makeVAO(v, 3, new Uint16Array(idx));
+})();
+
+/* ---------------------------------------------------------- Programlar */
+const dropProg    = makeProg(quadVS, dropFS);
+const updateProg  = makeProg(quadVS, updateFS);
+const normalProg  = makeProg(quadVS, normalFS);
+const moveProg    = makeProg(quadVS, sphereMoveFS);
+const poolProg    = makeProg(poolVS, poolFS);
+const sphereProg  = makeProg(sphereVS, sphereFS);
+const waterProg   = makeProg(waterVS, waterFS);
+const causticProg = makeProg(causticVS, causticFS);
+
+/* ---------------------------------------------------------- Durum */
+let A = makeTarget(N, N), B = makeTarget(N, N);
+const causticT = makeTarget(CAUSTIC_RES, CAUSTIC_RES);
+
+const light = (() => { const v = [2, 2, -1], l = Math.hypot(...v); return v.map(x => x / l); })();
+const R = 0.25;
+const center = [-0.4, -0.75, 0.2];
+const oldCenter = center.slice();
+const velocity = [0, 0, 0];
+const gravity = -4;
+let dragging = false, rain = false, paused = false;
+
+function simPass(prog, setup) {
+  use(prog);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, B.fbo);
+  gl.viewport(0, 0, N, N);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, A.tex);
+  seti('tex', 0); set('delta', [1 / N, 1 / N]);
+  if (setup) setup();
+  draw(quad);
+  [A, B] = [B, A];
+}
+const addDrop = (x, z, r, s) => simPass(dropProg, () => { set('center', [x, z]); set('radius', r); set('strength', s); });
+const stepSim = () => simPass(updateProg);
+const updateNormals = () => simPass(normalProg);
+const moveSphere = () => simPass(moveProg, () => { set('oldCenter', oldCenter); set('newCenter', center); set('radius', R); });
+
+function updateCaustics() {
+  use(causticProg);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, causticT.fbo);
+  gl.viewport(0, 0, CAUSTIC_RES, CAUSTIC_RES);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, null);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, A.tex);
+  seti('water', 0);
+  set('light', light); set('sphereCenter', center); set('sphereRadius', R);
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  draw(grid);
+}
+
+/* fiziksel adım (sabit 60 Hz) */
+function tick(h) {
+  if (!dragging) {
+    const pct = Math.min(1, Math.max(0, (R - center[1]) / (2 * R)));
+    velocity[1] += gravity * (h - 1.1 * h * pct);
+    const speed = Math.hypot(...velocity);
+    if (speed > 0) {
+      const k = Math.min(0.95, pct * h * speed);
+      for (let i = 0; i < 3; i++) velocity[i] *= (1 - k);
+    }
+    for (let i = 0; i < 3; i++) center[i] += velocity[i] * h;
+    if (center[1] < R - 1) { center[1] = R - 1; velocity[1] = Math.abs(velocity[1]) * 0.7; }
+    center[0] = Math.min(1 - R, Math.max(R - 1, center[0]));
+    center[2] = Math.min(1 - R, Math.max(R - 1, center[2]));
+  } else { velocity[0] = velocity[1] = velocity[2] = 0; }
+
+  moveSphere();
+  oldCenter[0] = center[0]; oldCenter[1] = center[1]; oldCenter[2] = center[2];
+
+  if (rain && Math.random() < 0.25) addDrop(Math.random() * 2 - 1, Math.random() * 2 - 1, 0.02 + Math.random() * 0.015, 0.006 + Math.random() * 0.008);
+  stepSim(); stepSim();
+}
+
+/* ---------------------------------------------------------- Matris/vektör */
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const norm = a => { const l = Math.hypot(...a); return [a[0]/l, a[1]/l, a[2]/l]; };
+function perspective(fovy, aspect, n, f) {
+  const t = 1 / Math.tan(fovy / 2), m = new Float32Array(16);
+  m[0] = t / aspect; m[5] = t; m[10] = (f + n) / (n - f); m[11] = -1; m[14] = 2 * f * n / (n - f);
+  return m;
+}
+function lookAt(e, c, up) {
+  const z = norm(sub(e, c)), x = norm(cross(up, z)), y = cross(z, x);
+  return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,e),-dot(y,e),-dot(z,e),1]);
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k*4+r] * b[c*4+k];
+    o[c*4+r] = s;
+  }
+  return o;
+}
+
+/* ---------------------------------------------------------- Kamera */
+const cam = { yaw: 0.7, pitch: 0.45, dist: 4.0, target: [0, -0.35, 0], fov: 45 * Math.PI / 180 };
+function camState() {
+  const cp = Math.cos(cam.pitch);
+  const eye = [cam.target[0] + cam.dist * cp * Math.sin(cam.yaw),
+               cam.target[1] + cam.dist * Math.sin(cam.pitch),
+               cam.target[2] + cam.dist * cp * Math.cos(cam.yaw)];
+  const f = norm(sub(cam.target, eye));
+  const right = norm(cross(f, [0, 1, 0]));
+  const up = cross(right, f);
+  return { eye, f, right, up };
+}
+function pickRay(ev) {
+  const r = canvas.getBoundingClientRect();
+  const x = ((ev.clientX - r.left) / r.width) * 2 - 1;
+  const y = 1 - ((ev.clientY - r.top) / r.height) * 2;
+  const s = camState(), th = Math.tan(cam.fov / 2), asp = r.width / r.height;
+  const dir = norm([0,1,2].map(i => s.f[i] + s.right[i] * x * th * asp + s.up[i] * y * th));
+  return { o: s.eye, d: dir, f: s.f };
+}
+
+/* ---------------------------------------------------------- Etkileşim */
+let mode = null, last = [0, 0], prevHit = null, dragPlaneN = null;
+
+function raySphereHit(o, d) {
+  const oc = sub(o, center), b = dot(oc, d), c = dot(oc, oc) - R * R, disc = b * b - c;
+  return disc > 0 && (-b - Math.sqrt(disc)) > 0;
+}
+function planeHit(o, d, p, n) {
+  const den = dot(d, n); if (Math.abs(den) < 1e-6) return null;
+  const t = dot(sub(p, o), n) / den; if (t < 0) return null;
+  return [o[0]+d[0]*t, o[1]+d[1]*t, o[2]+d[2]*t];
+}
+
+canvas.addEventListener('pointerdown', ev => {
+  canvas.setPointerCapture(ev.pointerId);
+  last = [ev.clientX, ev.clientY];
+  const ray = pickRay(ev);
+  if (raySphereHit(ray.o, ray.d)) {
+    mode = 'sphere'; dragging = true;
+    dragPlaneN = [-ray.f[0], -ray.f[1], -ray.f[2]];
+    prevHit = planeHit(ray.o, ray.d, center, dragPlaneN);
+    canvas.style.cursor = 'grabbing';
+    return;
+  }
+  const h = planeHit(ray.o, ray.d, [0, 0, 0], [0, 1, 0]);
+  if (h && Math.abs(h[0]) < 1 && Math.abs(h[2]) < 1) {
+    mode = 'ripple'; addDrop(h[0], h[2], 0.03, 0.01);
+  } else { mode = 'orbit'; canvas.style.cursor = 'grabbing'; }
+});
+canvas.addEventListener('pointermove', ev => {
+  if (!mode) return;
+  if (mode === 'orbit') {
+    cam.yaw -= (ev.clientX - last[0]) * 0.01;
+    cam.pitch = Math.min(1.5, Math.max(-1.4, cam.pitch + (ev.clientY - last[1]) * 0.01));
+    last = [ev.clientX, ev.clientY];
+  } else if (mode === 'ripple') {
+    const ray = pickRay(ev), h = planeHit(ray.o, ray.d, [0, 0, 0], [0, 1, 0]);
+    if (h && Math.abs(h[0]) < 1 && Math.abs(h[2]) < 1) addDrop(h[0], h[2], 0.03, 0.01);
+  } else if (mode === 'sphere') {
+    const ray = pickRay(ev), h = planeHit(ray.o, ray.d, center, dragPlaneN);
+    if (h && prevHit) {
+      for (let i = 0; i < 3; i++) center[i] += h[i] - prevHit[i];
+      center[0] = Math.min(1 - R, Math.max(R - 1, center[0]));
+      center[1] = Math.min(10, Math.max(R - 1, center[1]));
+      center[2] = Math.min(1 - R, Math.max(R - 1, center[2]));
+      prevHit = h;
+    }
+  }
+});
+const endPointer = () => { mode = null; dragging = false; canvas.style.cursor = 'grab'; };
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  cam.dist = Math.min(8, Math.max(2, cam.dist * (1 + Math.sign(e.deltaY) * 0.08)));
+}, { passive: false });
+
+/* ---------------------------------------------------------- Arayüz */
+const bRain = document.getElementById('bRain'), bPause = document.getElementById('bPause');
+function toggleRain() { rain = !rain; bRain.classList.toggle('off', !rain); }
+function togglePause() { paused = !paused; bPause.classList.toggle('off', !paused); }
+function dropSphere() {
+  center[0] = (Math.random() * 2 - 1) * 0.5; center[1] = 1.6; center[2] = (Math.random() * 2 - 1) * 0.5;
+  velocity[0] = velocity[1] = velocity[2] = 0;
+}
+bRain.onclick = toggleRain; bPause.onclick = togglePause;
+document.getElementById('bDrop').onclick = dropSphere;
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); dropSphere(); }
+  else if (e.key === 'r' || e.key === 'R') toggleRain();
+  else if (e.key === 'p' || e.key === 'P') togglePause();
+});
+
+/* ---------------------------------------------------------- Çizim */
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+function setCommon() {
+  seti('water', 0); seti('causticTex', 1);
+  set('light', light); set('sphereCenter', center); set('sphereRadius', R);
+}
+function render() {
+  resize();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.02, 0.03, 0.05, 1);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, A.tex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, causticT.tex);
+
+  const s = camState();
+  const mvp = mul(perspective(cam.fov, canvas.width / canvas.height, 0.05, 50), lookAt(s.eye, cam.target, [0, 1, 0]));
+
+  gl.enable(gl.CULL_FACE); gl.cullFace(gl.FRONT);
+  use(poolProg); setCommon(); set('mvp', mvp); draw(cube);
+
+  gl.disable(gl.CULL_FACE);
+  use(sphereProg); setCommon(); set('mvp', mvp); draw(sphereMesh);
+
+  gl.enable(gl.CULL_FACE);
+  for (let i = 0; i < 2; i++) {
+    gl.cullFace(i ? gl.FRONT : gl.BACK);
+    use(waterProg); setCommon(); set('mvp', mvp); set('eye', s.eye); set('underwater', i);
+    draw(grid);
+  }
+  gl.disable(gl.CULL_FACE);
+}
+
+/* ---------------------------------------------------------- Başlangıç */
+for (let i = 0; i < 20; i++) addDrop(Math.random() * 2 - 1, Math.random() * 2 - 1, 0.03, (i & 1) ? 0.01 : -0.01);
+updateNormals(); updateCaustics();
+
+let prevT = performance.now(), acc = 0;
+const STEP = 1 / 60;
+function frame(now) {
+  const dt = Math.min(0.1, (now - prevT) / 1000); prevT = now;
+  if (!paused) {
+    acc += dt;
+    let n = 0;
+    while (acc >= STEP && n < 4) { tick(STEP); acc -= STEP; n++; }
+    if (n > 0) { updateNormals(); updateCaustics(); }
+    if (acc > STEP) acc = 0;
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
